@@ -33,6 +33,7 @@
 #include <linux/compat.h>
 #include <linux/mnt_idmapping.h>
 #include <linux/filelock.h>
+#include <lttle/trigger.h>
 
 #include "internal.h"
 
@@ -1552,6 +1553,7 @@ static int filp_flush(struct file *filp, fl_owner_t id)
 		dnotify_flush(filp, id);
 		locks_remove_posix(filp, id);
 	}
+	lttle_check_close(filp);
 	return retval;
 }
 

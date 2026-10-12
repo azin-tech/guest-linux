@@ -108,6 +108,8 @@
 #include <net/busy_poll.h>
 #include <linux/errqueue.h>
 #include <linux/ptp_clock_kernel.h>
+
+#include <lttle/trigger.h>
 #include <trace/events/sock.h>
 
 #include "core/dev.h"
@@ -1889,8 +1891,12 @@ int __sys_bind(int fd, struct sockaddr __user *umyaddr, int addrlen)
 {
 	struct socket *sock;
 	struct sockaddr_storage address;
+	struct sockaddr *addr;
+	struct sockaddr_in *addr_in;
 	CLASS(fd, f)(fd);
 	int err;
+	bool compatible_family_trigger = false;
+	char trigger_data[7] = {0};
 
 	if (fd_empty(f))
 		return -EBADF;
@@ -1902,7 +1908,30 @@ int __sys_bind(int fd, struct sockaddr __user *umyaddr, int addrlen)
 	if (unlikely(err))
 		return err;
 
-	return __sys_bind_socket(sock, &address, addrlen);
+	addr = (struct sockaddr *)&address;
+	if (addr->sa_family == AF_INET) {
+		compatible_family_trigger = true;
+		addr_in = (struct sockaddr_in *)addr;
+
+		// trigger_data[0..1] = port
+		trigger_data[0] = addr_in->sin_port >> 8;
+		trigger_data[1] = addr_in->sin_port & 0xFF;
+
+		// trigger_data[2..5] = address
+		trigger_data[2] = addr_in->sin_addr.s_addr >> 24;
+		trigger_data[3] = addr_in->sin_addr.s_addr >> 16;
+		trigger_data[4] = addr_in->sin_addr.s_addr >> 8;
+		trigger_data[5] = addr_in->sin_addr.s_addr;
+
+		lttle_sys_trigger(LTTLE_SYS_BIND_BEFORE, trigger_data);
+	}
+
+	err = __sys_bind_socket(sock, &address, addrlen);
+
+	if (err == 0 && compatible_family_trigger)
+		lttle_sys_trigger(LTTLE_SYS_BIND_AFTER, trigger_data);
+
+	return err;
 }
 
 SYSCALL_DEFINE3(bind, int, fd, struct sockaddr __user *, umyaddr, int, addrlen)
@@ -1933,6 +1962,9 @@ int __sys_listen(int fd, int backlog)
 {
 	CLASS(fd, f)(fd);
 	struct socket *sock;
+	int err;
+	bool compatible_family_trigger = false;
+	char trigger_data[7] = {0};
 
 	if (fd_empty(f))
 		return -EBADF;
@@ -1940,7 +1972,27 @@ int __sys_listen(int fd, int backlog)
 	if (unlikely(!sock))
 		return -ENOTSOCK;
 
-	return __sys_listen_socket(sock, backlog);
+	if (sock->sk) {
+		compatible_family_trigger = true;
+
+		// trigger_data[0..1] = port (local port for listening socket)
+		trigger_data[0] = sock->sk->sk_num & 0xFF;
+		trigger_data[1] = sock->sk->sk_num >> 8;
+		// trigger_data[2..5] = address (local address)
+		trigger_data[2] = sock->sk->sk_rcv_saddr >> 24;
+		trigger_data[3] = sock->sk->sk_rcv_saddr >> 16;
+		trigger_data[4] = sock->sk->sk_rcv_saddr >> 8;
+		trigger_data[5] = sock->sk->sk_rcv_saddr;
+
+		lttle_sys_trigger(LTTLE_SYS_LISTEN_BEFORE, trigger_data);
+	}
+
+	err = __sys_listen_socket(sock, backlog);
+
+	if (err == 0 && compatible_family_trigger)
+		lttle_sys_trigger(LTTLE_SYS_LISTEN_AFTER, trigger_data);
+
+	return err;
 }
 
 SYSCALL_DEFINE2(listen, int, fd, int, backlog)
