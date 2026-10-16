@@ -31,7 +31,8 @@
  * The VMM writes FORK_PHASE_REQ_RESUME_FORK (3) to guest physical address
  * 0x6348 (fork mailbox + 0x348) and injects an NMI before starting vCPUs.
  * This NMI handler checks the mailbox, and if a fork resume is requested:
- *   1. Writes to APIC_TMICT to trigger KVM to create an hrtimer
+ *   1. Re-arms the LAPIC timer (one-shot / TSC-deadline, never periodic)
+ *      to trigger KVM to create an hrtimer
  *   2. Reconfigures network, hostname, entropy from fork mailbox
  *
  * The fork mailbox physical address and phase offset must match the VMM.
@@ -83,7 +84,7 @@ static DECLARE_WORK(fork_reconfig_work, fork_reconfig_work_fn);
 static void fork_resume_irq_work(struct irq_work *work)
 {
 	u32 lvt, lvt_new, tmict, apicbase_lo, apicbase_hi;
-	u64 msr_val;
+	u64 msr_val, deadline = 0;
 	int cpu = smp_processor_id();
 
 	/*
@@ -106,8 +107,20 @@ static void fork_resume_irq_work(struct irq_work *work)
 	 * Step 2: Re-arm LAPIC timer.
 	 *
 	 * On AMD, KVM_SET_LAPIC restores register values but doesn't arm
-	 * the host hrtimer. Writing APIC_TMICT triggers a VM exit that
-	 * creates the hrtimer. Use periodic mode at ~10Hz.
+	 * the host hrtimer. A write to the timer's count register traps to
+	 * KVM and creates it.
+	 *
+	 * The LVTT mode must stay the one the lapic clockevent programs,
+	 * i.e. what __setup_APIC_LVTT() picks for one-shot: TSC-deadline
+	 * when the CPU has it, plain one-shot otherwise. KVM drops writes to
+	 * IA32_TSC_DEADLINE unless LVTT is in TSC-deadline mode, and ignores
+	 * TMICT while it is. This used to force periodic mode with
+	 * TMICT=23700000, which left every deadline the guest programmed
+	 * after a restore dropped: hrtimers only fired on the 47.4 ms
+	 * periodic tick, so sleep(1ms) took ~47 ms.
+	 *
+	 * Fire immediately in the right mode. The interrupt runs
+	 * hrtimer_interrupt(), which programs the real next event.
 	 */
 	lvt = apic_read(APIC_LVTT);
 	tmict = apic_read(APIC_TMICT);
@@ -116,13 +129,22 @@ static void fork_resume_irq_work(struct irq_work *work)
 	pr_info("lttle: CPU %d BEFORE: LVTT=0x%08x TMICT=%u APICBASE=0x%08x\n",
 		cpu, lvt, tmict, apicbase_lo);
 
-	lvt_new = (lvt & 0xFF) | (1 << 17); /* periodic + keep vector */
-	apic_write(APIC_LVTT, lvt_new);
-	apic_write(APIC_TMICT, 23700000);
+	lvt_new = LOCAL_TIMER_VECTOR;
+	if (boot_cpu_has(X86_FEATURE_TSC_DEADLINE_TIMER)) {
+		lvt_new |= APIC_LVT_TIMER_TSCDEADLINE;
+		apic_write(APIC_LVTT, lvt_new);
+		/* Same serialization as __setup_APIC_LVTT/lapic_next_deadline. */
+		asm volatile("mfence" : : : "memory");
+		weak_wrmsr_fence();
+		wrmsrq(MSR_IA32_TSC_DEADLINE, rdtsc());
+		rdmsrq(MSR_IA32_TSC_DEADLINE, deadline);
+	} else {
+		apic_write(APIC_LVTT, lvt_new);
+		apic_write(APIC_TMICT, 1);
+	}
 
-	pr_info("lttle: CPU %d AFTER: LVTT=0x%08x TMICT=%u TMCCT=%u\n",
-		cpu, apic_read(APIC_LVTT), apic_read(APIC_TMICT),
-		apic_read(APIC_TMCCT));
+	pr_info("lttle: CPU %d AFTER: LVTT=0x%08x TMICT=%u TSC_DEADLINE=%llu\n",
+		cpu, apic_read(APIC_LVTT), apic_read(APIC_TMICT), deadline);
 
 	/* Step 3: Schedule fork reconfiguration (network, hostname, entropy).
 	 * Only CPU 0 does this. call_usermodehelper needs process context,
